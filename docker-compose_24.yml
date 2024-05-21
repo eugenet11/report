@@ -1,0 +1,353 @@
+version: "3.8"
+services:
+
+  ## External dependencies
+
+  gateway:
+    image: traefik:v2.0.7
+    container_name: traefik
+    logging: &logging
+      driver: "json-file"
+      options:
+        max-size: 100m
+        max-file: "5"
+    ports:
+      - "8080:8080" # ReportPortal UI
+      - "8081:8081" # Traefik dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command:
+      - --providers.docker=true
+      - --providers.docker.constraints=Label(`traefik.expose`, `true`)
+      - --entrypoints.web.address=:8080
+      - --entrypoints.traefik.address=:8081
+      - --api.dashboard=true
+      - --api.insecure=true
+    restart: always
+
+  opensearch:
+    image: opensearchproject/opensearch:2.11.0
+    container_name: opensearch
+    logging:
+      <<: *logging
+    environment:
+      discovery.type: single-node
+      plugins.security.disabled: "true"
+      bootstrap.memory_lock: "true"
+      OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ## Expose OpenSearch
+    # ports:
+    #   - "9200:9200"
+    #   - "9600:9600"
+    volumes:
+      - opensearch:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD", "curl","-s" ,"-f", "http://0.0.0.0:9200/_cat/health"]
+
+  analyzer:
+    image: &analyzer_img reportportal/service-auto-analyzer:5.11.0
+    container_name: reportportal-analyzer
+    logging:
+      <<: *logging
+    environment:
+      LOGGING_LEVEL: info
+      AMQP_EXCHANGE_NAME: analyzer-default
+      AMQP_VIRTUAL_HOST: analyzer
+      AMQP_URL: amqp://rabbitmq:rabbitmq@rabbitmq:5672
+      AMQP_URL: amqp://rabbitmq:rabbitmq@rabbitmq:5672
+      ES_HOSTS: http://elastic:elastic1q2w3e@elasticsearch:9200
+      MINIO_SHORT_HOST: ${SHORT_BUCKET_HOST}
+      ANALYZER_BINARYSTORE_MINIO_REGION: ${AWS_REGION} 
+      MINIO_ACCESS_KEY: ${BUCKET_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${BUCKET_SECRET_KEY}
+    depends_on:
+      opensearch:
+        condition: service_started
+    restart: always
+
+  analyzer-train:
+    image: *analyzer_img
+    container_name: reportportal-analyzer-train
+    logging:
+      <<: *logging
+    environment:
+      LOGGING_LEVEL: info
+      AMQP_EXCHANGE_NAME: analyzer-default
+      AMQP_VIRTUAL_HOST: analyzer
+      AMQP_URL: amqp://rabbitmq:rabbitmq@rabbitmq:5672
+      # ES_USER: 
+      # ES_PASSWORD: 
+      ES_HOSTS: http://opensearch:9200
+      INSTANCE_TASK_TYPE: train
+      UWSGI_WORKERS: 1
+      MINIO_SHORT_HOST: ${SHORT_BUCKET_HOST}
+      MINIO_ACCESS_KEY: ${BUCKET_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${BUCKET_ACCESS_KEY}
+    restart: always
+
+  metrics-gatherer:
+    image: reportportal/service-metrics-gatherer:5.11.0
+    container_name: reportportal-metrics-gatherer
+    logging:
+      <<: *logging
+    environment:
+      LOGGING_LEVEL: info
+      ES_USER: elastic
+      ES_PASSWORD: elastic1q2w3e 
+      ES_HOST: http://opensearch:9200
+      POSTGRES_USER: ${DATABASE_USER}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD}
+      POSTGRES_DB: ${DATABASE_NAME}
+      POSTGRES_HOST: ${DB_HOST}
+      POSTGRES_PORT: 5432
+      ALLOWED_START_TIME: "22:00"
+      ALLOWED_END_TIME: "08:00"
+      # TZ: Europe/Minsk you can change a timezone like this to specify when metrics are gathered
+      AMQP_URL: amqp://rabbitmq:rabbitmq@rabbitmq:5672
+      AMQP_VIRTUAL_HOST: analyzer
+    depends_on:
+      opensearch:
+        condition: service_started
+    restart: always
+
+  rabbitmq:
+    image: bitnami/rabbitmq:3.12.2-debian-11-r8
+    container_name: rabbitmq
+    logging:
+      <<: *logging
+    ## Expose RabbitMQ
+    # ports:
+    #   - "5672:5672"
+    #   - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: &rabbitmq_user rabbitmq
+      RABBITMQ_DEFAULT_PASS: &rabbitmq_password rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+    restart: always
+
+   uat:
+    image: reportportal/service-authorization:5.11.0
+    container_name: reportportal-uat
+    logging:
+      <<: *logging
+    environment:
+     - RP_DB_HOST=${DB_HOST}
+      - RP_DB_USER=${DATABASE_USER}
+      - RP_DB_PASS=${DATABASE_PASSWORD}
+      - RP_DB_NAME=${DATABASE_NAME}
+      - RP_BINARYSTORE_TYPE=minio
+      - RP_BINARYSTORE_MINIO_ENDPOINT=${BUCKET_URL}
+      - RP_BINARYSTORE_MINIO_REGION=${AWS_REGION}
+      - RP_BINARYSTORE_MINIO_ACCESSKEY=${BUCKET_ACCESS_KEY}
+      - RP_BINARYSTORE_MINIO_SECRETKEY=${BUCKET_SECRET_KEY}
+      - RP_SESSION_LIVE=86400 #in seconds
+      RP_SAML_SESSION-LIVE: 4320
+      ## RP_INITIAL_ADMIN_PASSWORD - the initial password of the superadmin user for the first launch. This value can't change the password on redeployments.
+      RP_INITIAL_ADMIN_PASSWORD: "erebus"
+      JAVA_OPTS: -Djava.security.egd=file:/dev/./urandom -XX:MinRAMPercentage=60.0 -XX:MaxRAMPercentage=90.0
+    healthcheck:
+      test: curl -f http://0.0.0.0:9999/health
+      interval: 60s
+      timeout: 30s
+      retries: 10
+      start_period: 60s
+    labels:
+      - "traefik.http.middlewares.uat-strip-prefix.stripprefix.prefixes=/uat"
+      - "traefik.http.routers.uat.middlewares=uat-strip-prefix@docker"
+      - "traefik.http.routers.uat.rule=PathPrefix(`/uat`)"
+      - "traefik.http.routers.uat.service=uat"
+      - "traefik.http.services.uat.loadbalancer.server.port=9999"
+      - "traefik.http.services.uat.loadbalancer.server.scheme=http"
+      - "traefik.expose=true"
+    restart: always
+
+  index:
+    image: reportportal/service-index:5.11.0
+    container_name: reportportal-index
+    logging:
+      <<: *logging
+    depends_on:
+      gateway:
+        condition: service_started
+    environment:
+      - LB_URL=http://gateway:8081
+      - TRAEFIK_V2_MODE=true
+    healthcheck:
+      test: wget -q --spider http://0.0.0.0:8080/health
+      interval: 30s
+      timeout: 30s
+      retries: 10
+      start_period: 10s
+    labels:
+      - "traefik.http.routers.index.rule=PathPrefix(`/`)"
+      - "traefik.http.routers.index.service=index"
+      - "traefik.http.services.index.loadbalancer.server.port=8080"
+      - "traefik.http.services.index.loadbalancer.server.scheme=http"
+      - "traefik.expose=true"
+    restart: always
+
+  api:
+    image: reportportal/service-api:5.11.0
+    container_name: reportportal-api
+    logging:
+      <<: *logging
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      gateway:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    environment:
+      environment:
+      - RP_DB_HOST=${DB_HOST}
+      - RP_DB_USER=${DATABASE_USER}
+      - RP_DB_PASS=${DATABASE_PASSWORD}
+      - RP_DB_NAME=${DATABASE_NAME}
+      - RP_AMQP_USER=rabbitmq
+      - RP_AMQP_PASS=rabbitmq
+      - RP_AMQP_APIUSER=rabbitmq
+      - RP_AMQP_APIPASS=rabbitmq
+      - RP_BINARYSTORE_TYPE=minio
+      - RP_BINARYSTORE_MINIO_ENDPOINT=${BUCKET_URL}
+      - RP_BINARYSTORE_MINIO_REGION=${AWS_REGION}
+      - RP_BINARYSTORE_MINIO_ACCESSKEY=${BUCKET_ACCESS_KEY}
+      - RP_BINARYSTORE_MINIO_SECRETKEY=${BUCKET_SECRET_KEY}
+      - LOGGING_LEVEL_ORG_HIBERNATE_SQL=info
+      RP_REQUESTLOGGING: "false"
+      AUDIT_LOGGER: "OFF"
+      MANAGEMENT_HEALTH_ELASTICSEARCH_ENABLED: "false"
+      RP_ENVIRONMENT_VARIABLE_ALLOW_DELETE_ACCOUNT: "false"
+      JAVA_OPTS: >
+        -Xmx1g 
+        -XX:+HeapDumpOnOutOfMemoryError 
+        -XX:HeapDumpPath=/tmp  
+        -Dcom.sun.management.jmxremote.rmi.port=12349 
+        -Dcom.sun.management.jmxremote 
+        -Dcom.sun.management.jmxremote.local.only=false  
+        -Dcom.sun.management.jmxremote.port=9010 
+        -Dcom.sun.management.jmxremote.authenticate=false 
+        -Dcom.sun.management.jmxremote.ssl=true 
+        -Djava.rmi.server.hostname=0.0.0.0
+      RP_JOBS_BASEURL: http://jobs:8686
+      COM_TA_REPORTPORTAL_JOB_INTERRUPT_BROKEN_LAUNCHES_CRON: PT1H
+      RP_ENVIRONMENT_VARIABLE_PATTERN-ANALYSIS_BATCH-SIZE: 100
+      RP_ENVIRONMENT_VARIABLE_PATTERN-ANALYSIS_PREFETCH-COUNT: 1
+      RP_ENVIRONMENT_VARIABLE_PATTERN-ANALYSIS_CONSUMERS-COUNT: 1
+    healthcheck:
+      test: curl -f http://0.0.0.0:8585/health
+      interval: 60s
+      timeout: 30s
+      retries: 10
+      start_period: 60s
+    labels:
+      - "traefik.http.middlewares.api-strip-prefix.stripprefix.prefixes=/api"
+      - "traefik.http.routers.api.middlewares=api-strip-prefix@docker"
+      - "traefik.http.routers.api.rule=PathPrefix(`/api`)"
+      - "traefik.http.routers.api.service=api"
+      - "traefik.http.services.api.loadbalancer.server.port=8585"
+      - "traefik.http.services.api.loadbalancer.server.scheme=http"
+      - "traefik.expose=true"
+    restart: always
+
+  jobs:
+    image: reportportal/service-jobs:5.11.0
+    container_name: reportportal-jobs
+    logging:
+      <<: *logging
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      gateway:
+        condition: service_started
+    environment:
+      ## Double entry moves test logs from PostgreSQL to Elastic-type engines
+      #№ Ref: https://reportportal.io/blog/double-entry-in-5.7.2
+      ## RP_ELASTICSEARCH_HOST: http://opensearch:9200
+      ## RP_ELASTICSEARCH_USERNAME: ""
+      ## RP_ELASTICSEARCH_PASSWORD: ""
+      RP_DB_HOST: ${DB_HOST}
+      RP_DB_USER: ${DATABASE_USER}
+      RP_DB_PASS: ${DATABASE_PASSWORD}
+      RP_DB_NAME: ${DATABASE_NAME}
+      RP_AMQP_USER: rabbitmq
+      RP_AMQP_PASS: rabbitmq
+      RP_AMQP_APIUSER: rabbitmq
+      RP_AMQP_APIPASS: rabbitmq
+      RP_BINARYSTORE_TYPE: minio
+      RP_BINARYSTORE_MINIO_ENDPOINT: ${BUCKET_URL}
+      RP_BINARYSTORE_MINIO_REGION: ${AWS_REGION}
+      RP_BINARYSTORE_MINIO_ACCESSKEY: ${BUCKET_ACCESS_KEY}
+      RP_BINARYSTORE_MINIO_SECRETKEY: ${BUCKET_SECRET_KEY}
+      RP_AMQP_ANALYZER-VHOST: analyzer
+      DATASTORE_TYPE: minio
+      RP_ENVIRONMENT_VARIABLE_CLEAN_ATTACHMENT_CRON: 0 0 */24 * * *
+      RP_ENVIRONMENT_VARIABLE_CLEAN_LOG_CRON: 0 0 */24 * * *
+      RP_ENVIRONMENT_VARIABLE_CLEAN_LAUNCH_CRON: 0 0 */24 * * *
+      RP_ENVIRONMENT_VARIABLE_CLEAN_STORAGE_CRON: 0 0 */24 * * *
+      RP_ENVIRONMENT_VARIABLE_STORAGE_PROJECT_CRON: 0 */5 * * * *
+      RP_ENVIRONMENT_VARIABLE_CLEAN_EXPIREDUSER_CRON:  0 0 */24 * * *
+      RP_ENVIRONMENT_VARIABLE_CLEAN_EXPIREDUSER_RETENTIONPERIOD: 365
+      RP_ENVIRONMENT_VARIABLE_NOTIFICATION_EXPIREDUSER_CRON: 0 0 */24 * * * 
+      RP_ENVIRONMENT_VARIABLE_CLEAN_EVENTS_RETENTIONPERIOD: 365
+      RP_ENVIRONMENT_VARIABLE_CLEAN_EVENTS_CRON: 0 30 05 * * *
+      RP_ENVIRONMENT_VARIABLE_CLEAN_STORAGE_CHUNKSIZE: 20000
+      RP_PROCESSING_LOG_MAXBATCHSIZE: 2000
+      RP_PROCESSING_LOG_MAXBATCHTIMEOUT: 6000
+      RP_AMQP_MAXLOGCONSUMER: 1
+      JAVA_OPTS: >
+        -Djava.security.egd=file:/dev/./urandom
+        -XX:+UseG1GC
+        -XX:+UseStringDeduplication
+        -XX:G1ReservePercent=20
+        -XX:InitiatingHeapOccupancyPercent=60
+        -XX:MaxRAMPercentage=70.0
+        -XX:+HeapDumpOnOutOfMemoryError
+        -XX:HeapDumpPath=/tmp
+    volumes:
+      - storage:/data/storage
+    healthcheck:
+      test: curl -f http://0.0.0.0:8686/health || exit 1
+      interval: 60s
+      timeout: 30s
+      retries: 10
+      start_period: 60s
+    labels:
+      - traefik.http.middlewares.jobs-strip-prefix.stripprefix.prefixes=/jobs
+      - traefik.http.routers.jobs.middlewares=jobs-strip-prefix@docker
+      - traefik.http.routers.jobs.rule=PathPrefix(`/jobs`)
+      - traefik.http.routers.jobs.service=jobs
+      - traefik.http.services.jobs.loadbalancer.server.port=8686
+      - traefik.http.services.jobs.loadbalancer.server.scheme=http
+      - traefik.expose=true
+    restart: always
+
+     ui:
+    image: reportportal/service-ui:5.11.0
+    container_name: reportportal-ui
+    environment:
+      RP_SERVER_PORT: "8080"
+    healthcheck:
+      test: wget -q --spider http://0.0.0.0:8080/health
+      interval: 30s
+      timeout: 30s
+      retries: 10
+      start_period: 10s
+    labels:
+      - "traefik.http.middlewares.ui-strip-prefix.stripprefix.prefixes=/ui"
+      - "traefik.http.routers.ui.middlewares=ui-strip-prefix@docker"
+      - "traefik.http.routers.ui.rule=PathPrefix(`/ui`)"
+      - "traefik.http.routers.ui.service=ui"
+      - "traefik.http.services.ui.loadbalancer.server.port=8080"
+      - "traefik.http.services.ui.loadbalancer.server.scheme=http"
+      - "traefik.expose=true"
+    restart: always
